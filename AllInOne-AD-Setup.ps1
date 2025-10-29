@@ -752,7 +752,8 @@ function Import-UsersFromCsv {
         $result.Created++
         Write-Log "Created user: $sam ($First $Last) -> $dept" -Color Green
       } catch {
-        Write-Log "Failed to create user $First $Last: $($_.Exception.Message)" -Color Red
+        $errorMessage = $_.Exception.Message
+        Write-Log ("Failed to create user {0} {1}: {2}" -f $First, $Last, $errorMessage) -Color Red
         $result.Malformed.Add("$First $Last (creation failed)") | Out-Null
         continue
       }
@@ -832,7 +833,7 @@ function Show-Verification {
   Write-Log ''
   Write-Log '--- Verification Summary ---' -Color Cyan
 
-  Write-Log "Shares on $ServerName:" -Color Cyan
+  Write-Log ("Shares on {0}:" -f $ServerName) -Color Cyan
   (Get-SmbShare | Where-Object { $_.Name -in ($Departments + 'Home' + 'Profiles') }) | ForEach-Object {
     Write-Log ("  {0,-20} {1}" -f $_.Name, $_.Path)
   }
