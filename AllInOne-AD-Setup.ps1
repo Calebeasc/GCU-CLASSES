@@ -1,14 +1,24 @@
 <# =======================================================================
- AllInOne-AD-Setup.ps1
- - Prompts for environment-specific values (server, base path, departments, passwords)
- - Creates or verifies C:\Shares (dept folders + Home + Profiles) + SMB shares
- - Creates matching Organizational Units and Global Security groups
- - Applies department NTFS defaults (Dept & IT = Full; Exec/Mgmt = RX, except IT)
- - Optionally imports users from CSV, sets H:, creates per-user home folders + ACLs
+ AllInOne-AD-Setup.ps1 (App Edition)
+ -----------------------------------------------------------------------
+ Provides a Windows Forms front-end for provisioning Active Directory lab
+ environments. The workflow collects environment details, builds/ensures
+ departmental shares and permissions, creates matching OUs and security
+ groups, imports users from CSV, provisions home directories, and
+ optionally creates an alternate administrative account.
+
+ Key capabilities
+   - GUI-driven configuration with defaults and validation
+   - Idempotent folder/share/OU/group creation routines
+   - CSV importer that accepts FullName or First/Last headers
+   - Automatic home folder provisioning with ACL management
+   - Domain autodetection with optional overrides
+   - Rich-text run log for status visibility when using the GUI
  ======================================================================= #>
 
 [CmdletBinding()]
 param(
+  # Optional parameter overrides still supported for automation scenarios.
   [string]$ServerName,
   [string]$BasePath,
   [string[]]$Departments,
@@ -19,107 +29,30 @@ param(
   [string]$AltAdminSamAccountName,
   [string]$AltAdminPassword,
   [switch]$SkipFoldersAndShares,
-  [switch]$SkipAclForDepartments
+  [switch]$SkipAclForDepartments,
+  [switch]$NoGui
 )
 
-# Load required modules for Active Directory and SMB management.
+# ---------------------------------------------------------------------------
+# Module loading and UI initialization
+# ---------------------------------------------------------------------------
+
 Import-Module ActiveDirectory -ErrorAction Stop
 Import-Module SmbShare        -ErrorAction Stop
 
-# Load Windows Forms assemblies so GUI prompts can be displayed in both PowerShell ISE and console.
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ---------------------------------------------------------------------------
-# GUI helper utilities
+# Domain discovery utilities
 # ---------------------------------------------------------------------------
 
-function Show-GuiInputDialog {
-  <#
-    .SYNOPSIS
-      Displays a simple dialog with a prompt, textbox, and OK/Cancel buttons.
-  #>
-  param(
-    [Parameter(Mandatory)][string]$Title,
-    [Parameter(Mandatory)][string]$Prompt,
-    [string]$DefaultText
-  )
-
-  $form = New-Object System.Windows.Forms.Form
-  $form.Text = $Title
-  $form.StartPosition = 'CenterScreen'
-  $form.FormBorderStyle = 'FixedDialog'
-  $form.MaximizeBox = $false
-  $form.MinimizeBox = $false
-  $form.Size = New-Object System.Drawing.Size(420,180)
-
-  $label = New-Object System.Windows.Forms.Label
-  $label.Text = $Prompt
-  $label.AutoSize = $true
-  $label.Location = New-Object System.Drawing.Point(12,12)
-  $label.MaximumSize = New-Object System.Drawing.Size(380,0)
-  $form.Controls.Add($label)
-
-  $textBox = New-Object System.Windows.Forms.TextBox
-  $textBox.Size = New-Object System.Drawing.Size(380,20)
-  $textBox.Location = New-Object System.Drawing.Point(12,70)
-  $textBox.Text = $DefaultText
-  $form.Controls.Add($textBox)
-
-  $okButton = New-Object System.Windows.Forms.Button
-  $okButton.Text = 'OK'
-  $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
-  $okButton.Location = New-Object System.Drawing.Point(220,110)
-  $form.Controls.Add($okButton)
-
-  $cancelButton = New-Object System.Windows.Forms.Button
-  $cancelButton.Text = 'Cancel'
-  $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-  $cancelButton.Location = New-Object System.Drawing.Point(310,110)
-  $form.Controls.Add($cancelButton)
-
-  $form.AcceptButton = $okButton
-  $form.CancelButton = $cancelButton
-
-  $dialogResult = $form.ShowDialog()
-  if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
-    return $textBox.Text
-  }
-
-  return $null
-}
-
-function Show-GuiFilePicker {
-  <#
-    .SYNOPSIS
-      Displays a file selection dialog and returns the chosen file path.
-  #>
-  param(
-    [Parameter(Mandatory)][string]$Title,
-    [string]$Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
-  )
-
-  $dialog = New-Object System.Windows.Forms.OpenFileDialog
-  $dialog.Title = $Title
-  $dialog.Filter = $Filter
-  $dialog.Multiselect = $false
-
-  $result = $dialog.ShowDialog()
-  if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-    return $dialog.FileName
-  }
-
-  return $null
-}
-
-# Collect core domain metadata for naming and LDAP operations.
 $Domain   = Get-ADDomain
 $DomainDN = $Domain.DistinguishedName
 $DNSRoot  = $Domain.DNSRoot
 $NetBIOS  = $Domain.NetBIOSName
 
-# Discover a writable domain controller to standardize subsequent AD operations.
 $dcObj = $null
 try {
   $dcObj = Get-ADDomainController -Discover -Writable -ErrorAction Stop
@@ -151,10 +84,79 @@ if (-not $DC) {
 }
 
 # ---------------------------------------------------------------------------
-# Path helper to coerce relative inputs into absolute file system paths.
+# Logging helpers (console + optional GUI log window)
+# ---------------------------------------------------------------------------
+
+$script:LogForm    = $null
+$script:LogTextBox = $null
+$script:LogClose   = $null
+$script:UseGuiLog  = $false
+
+function Write-Log {
+  param(
+    [string]$Message,
+    [ConsoleColor]$Color = [ConsoleColor]::Gray
+  )
+
+  if (-not $Message) { return }
+
+  Write-Host $Message -ForegroundColor $Color
+
+  if ($script:LogTextBox) {
+    $script:LogTextBox.AppendText("$Message`r`n")
+    $script:LogTextBox.SelectionStart = $script:LogTextBox.TextLength
+    $script:LogTextBox.ScrollToCaret()
+    [System.Windows.Forms.Application]::DoEvents()
+  }
+}
+
+function Initialize-LogWindow {
+  if ($script:LogForm) { return }
+
+  $script:LogForm = New-Object System.Windows.Forms.Form
+  $script:LogForm.Text = 'AllInOne AD Setup - Activity Log'
+  $script:LogForm.Size = New-Object System.Drawing.Size(820,520)
+  $script:LogForm.StartPosition = 'CenterScreen'
+
+  $script:LogTextBox = New-Object System.Windows.Forms.RichTextBox
+  $script:LogTextBox.Dock = 'Fill'
+  $script:LogTextBox.ReadOnly = $true
+  $script:LogTextBox.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
+  $script:LogTextBox.ForeColor = [System.Drawing.Color]::FromArgb(235,235,235)
+  $script:LogTextBox.Font      = New-Object System.Drawing.Font('Consolas',10)
+
+  $panel = New-Object System.Windows.Forms.Panel
+  $panel.Dock = 'Bottom'
+  $panel.Height = 50
+
+  $script:LogClose = New-Object System.Windows.Forms.Button
+  $script:LogClose.Text = 'Close'
+  $script:LogClose.Enabled = $false
+  $script:LogClose.Size = New-Object System.Drawing.Size(90,28)
+  $script:LogClose.Location = New-Object System.Drawing.Point(705,10)
+  $script:LogClose.Add_Click({
+    $script:LogForm.Close()
+  })
+
+  $panel.Controls.Add($script:LogClose)
+
+  $script:LogForm.Controls.Add($script:LogTextBox)
+  $script:LogForm.Controls.Add($panel)
+
+  $script:LogForm.Show()
+  [System.Windows.Forms.Application]::DoEvents()
+  $script:UseGuiLog = $true
+}
+
+# ---------------------------------------------------------------------------
+# Path and input helpers
 # ---------------------------------------------------------------------------
 
 function Resolve-AbsolutePath {
+  <#
+    .SYNOPSIS
+      Normalizes relative or rooted paths to absolute file system paths.
+  #>
   param([Parameter(Mandatory)][string]$Path)
 
   if ([string]::IsNullOrWhiteSpace($Path)) {
@@ -174,935 +176,812 @@ function Resolve-AbsolutePath {
   }
 }
 
+function ConvertTo-DepartmentList {
+  <#
+    .SYNOPSIS
+      Splits a comma or newline separated list into a sanitized department array.
+  #>
+  param([string]$Text)
+
+  if ([string]::IsNullOrWhiteSpace($Text)) {
+    return @()
+  }
+
+  $parts = $Text -split '[\r\n,]'
+  return $parts | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+}
+
+function Show-GuiFilePicker {
+  <#
+    .SYNOPSIS
+      Opens a file selection dialog and returns the chosen path.
+  #>
+  param(
+    [string]$Title = 'Select a file',
+    [string]$Filter = 'All files (*.*)|*.*'
+  )
+
+  $dialog = New-Object System.Windows.Forms.OpenFileDialog
+  $dialog.Title = $Title
+  $dialog.Filter = $Filter
+  $dialog.Multiselect = $false
+
+  if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    return $dialog.FileName
+  }
+
+  return $null
+}
+
 # ---------------------------------------------------------------------------
-# Gather runtime inputs (GUI prompts when parameters are not supplied)
+# GUI configuration dialog
 # ---------------------------------------------------------------------------
 
-$defaultServerName = $env:COMPUTERNAME
-if (-not $PSBoundParameters.ContainsKey('ServerName') -or [string]::IsNullOrWhiteSpace($ServerName)) {
-  $serverPrompt = Show-GuiInputDialog -Title 'Share Host' -Prompt ("Enter the server name that will host shares. Leave blank to use {0}." -f $defaultServerName) -DefaultText $defaultServerName
-  if ([string]::IsNullOrWhiteSpace($serverPrompt)) {
-    $ServerName = $defaultServerName
-  } else {
-    $ServerName = $serverPrompt.Trim()
+function Get-ConfigurationFromGui {
+  <#
+    .SYNOPSIS
+      Presents a Windows Forms dialog to capture configuration settings.
+  #>
+
+  $form = New-Object System.Windows.Forms.Form
+  $form.Text = 'AllInOne AD Setup - Configuration'
+  $form.Size = New-Object System.Drawing.Size(720,640)
+  $form.StartPosition = 'CenterScreen'
+  $form.FormBorderStyle = 'FixedDialog'
+  $form.MaximizeBox = $false
+  $form.MinimizeBox = $false
+
+  $font = New-Object System.Drawing.Font('Segoe UI',9)
+  $form.Font = $font
+
+  $layout = New-Object System.Windows.Forms.TableLayoutPanel
+  $layout.Dock = 'Fill'
+  $layout.ColumnCount = 3
+  $layout.RowCount = 14
+  $layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent,30)))
+  $layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent,50)))
+  $layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent,20)))
+
+  for ($i = 0; $i -lt 14; $i++) {
+    $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
   }
-} else {
-  $ServerName = $ServerName.Trim()
-}
 
-$defaultBasePath = 'C:\Shares'
-if (-not $PSBoundParameters.ContainsKey('BasePath') -or [string]::IsNullOrWhiteSpace($BasePath)) {
-  $basePrompt = Show-GuiInputDialog -Title 'Base Path' -Prompt ("Enter base folder for shares. Leave blank to use {0}." -f $defaultBasePath) -DefaultText $defaultBasePath
-  if ([string]::IsNullOrWhiteSpace($basePrompt)) {
-    $BasePath = $defaultBasePath
-  } else {
-    $BasePath = $basePrompt.Trim()
-  }
-} else {
-  $BasePath = $BasePath.Trim()
-}
+  $defServer = $env:COMPUTERNAME
+  $defBase   = 'C:\Shares'
 
-$BasePath = Resolve-AbsolutePath -Path $BasePath
+  # Helper for labeled textbox rows
+  function Add-InputRow {
+    param(
+      [string]$LabelText,
+      [System.Windows.Forms.Control]$Control,
+      [System.Windows.Forms.Control]$Button
+    )
 
-$defaultDeptString = 'Executives, HR, IT, Management, Accounting, Doctors, Nurses, Laboratory, Medical Records, Facilities'
-if (-not $PSBoundParameters.ContainsKey('Departments') -or -not $Departments -or $Departments.Count -eq 0) {
-  do {
-    $deptPrompt = Show-GuiInputDialog -Title 'Departments' -Prompt 'Enter ~10 department names, comma-separated (e.g., HR, IT, Accounting, ...). Leave blank to use the suggested defaults.' -DefaultText $defaultDeptString
-    if ([string]::IsNullOrWhiteSpace($deptPrompt)) {
-      $deptPrompt = $defaultDeptString
+    $row = $layout.RowCount
+    $layout.RowCount++
+    $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $LabelText
+    $label.AutoSize = $true
+    $label.Margin = New-Object System.Windows.Forms.Padding(6,8,6,4)
+
+    $Control.Margin = New-Object System.Windows.Forms.Padding(6,4,6,4)
+    if ($Button) {
+      $Button.Margin = New-Object System.Windows.Forms.Padding(6,4,6,4)
     }
-    $Departments = $deptPrompt -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-    if ($Departments.Count -lt 5) {
-      [void][System.Windows.Forms.MessageBox]::Show('Please enter at least 5 departments.','Validation',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning)
+
+    $layout.Controls.Add($label,0,$row)
+    $layout.Controls.Add($Control,1,$row)
+    if ($Button) { $layout.Controls.Add($Button,2,$row) }
+  }
+
+  $serverBox = New-Object System.Windows.Forms.TextBox
+  $serverBox.Text = $defServer
+  Add-InputRow -LabelText 'Share host (server name)' -Control $serverBox
+
+  $baseBox = New-Object System.Windows.Forms.TextBox
+  $baseBox.Text = $defBase
+  $baseBrowse = New-Object System.Windows.Forms.Button
+  $baseBrowse.Text = 'Browse...'
+  $baseBrowse.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Select the base directory for departmental shares'
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+      $baseBox.Text = $dlg.SelectedPath
     }
-  } while ($Departments.Count -lt 5)
-} else {
-  $Departments = $Departments | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-}
+  })
+  Add-InputRow -LabelText 'Base folder for shares' -Control $baseBox -Button $baseBrowse
 
-if ($Departments.Count -lt 5) {
-  throw 'Please enter at least 5 departments.'
-}
+  $deptBox = New-Object System.Windows.Forms.TextBox
+  $deptBox.Multiline = $true
+  $deptBox.Height = 80
+  $deptBox.ScrollBars = 'Vertical'
+  $deptBox.Text = "Executives,HR,IT,Management,Accounting,Doctors,Nurses,Laboratory,Medical Records,Facilities"
+  Add-InputRow -LabelText 'Departments (comma or newline separated)' -Control $deptBox
 
-$defaultPasswordValue = 'Red.vine1'
-if (-not $PSBoundParameters.ContainsKey('DefaultPassword') -or [string]::IsNullOrWhiteSpace($DefaultPassword)) {
-  $pwdPrompt = Show-GuiInputDialog -Title 'Default Password' -Prompt ("Enter default password for new users. Leave blank to use {0}." -f $defaultPasswordValue) -DefaultText $defaultPasswordValue
-  if ([string]::IsNullOrWhiteSpace($pwdPrompt)) {
-    $DefaultPassword = $defaultPasswordValue
-  } else {
-    $DefaultPassword = $pwdPrompt.Trim()
-  }
-} else {
-  $DefaultPassword = $DefaultPassword.Trim()
-}
+  $passwordBox = New-Object System.Windows.Forms.TextBox
+  $passwordBox.UseSystemPasswordChar = $true
+  $passwordBox.Text = 'Red.vine1'
+  Add-InputRow -LabelText 'Default password for new users' -Control $passwordBox
 
-$SecurePwd = ConvertTo-SecureString $DefaultPassword -AsPlainText -Force
+  $upnBox = New-Object System.Windows.Forms.TextBox
+  $upnBox.Text = $DNSRoot
+  Add-InputRow -LabelText 'UPN suffix (domain)' -Control $upnBox
 
-$altAdminDefaultName = 'Lab Administrator'
-if (-not $PSBoundParameters.ContainsKey('AltAdminDisplayName') -or [string]::IsNullOrWhiteSpace($AltAdminDisplayName)) {
-  $altAdminNamePrompt = Show-GuiInputDialog -Title 'Alternate Admin Name' -Prompt 'Enter the display name for the alternate administrative account.' -DefaultText $altAdminDefaultName
-  if ([string]::IsNullOrWhiteSpace($altAdminNamePrompt)) {
-    $AltAdminDisplayName = $altAdminDefaultName
-  } else {
-    $AltAdminDisplayName = $altAdminNamePrompt.Trim()
-  }
-} else {
-  $AltAdminDisplayName = $AltAdminDisplayName.Trim()
-}
+  $csvBox = New-Object System.Windows.Forms.TextBox
+  $csvBrowse = New-Object System.Windows.Forms.Button
+  $csvBrowse.Text = 'Select CSV...'
+  $csvBrowse.Add_Click({
+    $file = Show-GuiFilePicker -Title 'Select user CSV file'
+    if ($file) { $csvBox.Text = $file }
+  })
+  Add-InputRow -LabelText 'User CSV path (optional)' -Control $csvBox -Button $csvBrowse
 
-if ([string]::IsNullOrWhiteSpace($AltAdminDisplayName)) {
-  throw 'Alternate admin display name cannot be blank.'
-}
+  $altDisplay = New-Object System.Windows.Forms.TextBox
+  Add-InputRow -LabelText 'Alt admin display name (optional)' -Control $altDisplay
 
-$altAdminDefaultSam = 'labadmin'
-if (-not $PSBoundParameters.ContainsKey('AltAdminSamAccountName') -or [string]::IsNullOrWhiteSpace($AltAdminSamAccountName)) {
-  $altAdminSamPrompt = Show-GuiInputDialog -Title 'Alternate Admin Username' -Prompt 'Enter the desired sAMAccountName for the alternate administrative account.' -DefaultText $altAdminDefaultSam
-  if ([string]::IsNullOrWhiteSpace($altAdminSamPrompt)) {
-    $AltAdminSamAccountName = $altAdminDefaultSam
-  } else {
-    $AltAdminSamAccountName = $altAdminSamPrompt.Trim()
-  }
-} else {
-  $AltAdminSamAccountName = $AltAdminSamAccountName.Trim()
-}
+  $altSam = New-Object System.Windows.Forms.TextBox
+  Add-InputRow -LabelText 'Alt admin username (sAM)' -Control $altSam
 
-if ([string]::IsNullOrWhiteSpace($AltAdminSamAccountName)) {
-  $AltAdminSamAccountName = $altAdminDefaultSam
-}
+  $altPass = New-Object System.Windows.Forms.TextBox
+  $altPass.UseSystemPasswordChar = $true
+  Add-InputRow -LabelText 'Alt admin password' -Control $altPass
 
-$altAdminPasswordDefault = $DefaultPassword
-if (-not $PSBoundParameters.ContainsKey('AltAdminPassword') -or [string]::IsNullOrWhiteSpace($AltAdminPassword)) {
-  $altAdminPasswordPrompt = Show-GuiInputDialog -Title 'Alternate Admin Password' -Prompt ('Enter the password for the alternate administrative account. Leave blank to reuse {0}.' -f $altAdminPasswordDefault) -DefaultText $altAdminPasswordDefault
-  if ([string]::IsNullOrWhiteSpace($altAdminPasswordPrompt)) {
-    $AltAdminPassword = $altAdminPasswordDefault
-  } else {
-    $AltAdminPassword = $altAdminPasswordPrompt.Trim()
-  }
-} else {
-  $AltAdminPassword = $AltAdminPassword.Trim()
-}
+  $skipShares = New-Object System.Windows.Forms.CheckBox
+  $skipShares.Text = 'Skip folder/share creation'
+  $skipShares.AutoSize = $true
+  $layout.Controls.Add($skipShares,1,$layout.RowCount)
+  $layout.RowCount++
+  $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 
-if ([string]::IsNullOrWhiteSpace($AltAdminPassword)) {
-  throw 'Alternate admin password cannot be blank.'
-}
+  $skipAcl = New-Object System.Windows.Forms.CheckBox
+  $skipAcl.Text = 'Skip department ACL reset'
+  $skipAcl.AutoSize = $true
+  $layout.Controls.Add($skipAcl,1,$layout.RowCount)
+  $layout.RowCount++
+  $layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 
-$AltAdminSecurePwd = ConvertTo-SecureString $AltAdminPassword -AsPlainText -Force
+  $buttonPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+  $buttonPanel.FlowDirection = 'RightToLeft'
+  $buttonPanel.Dock = 'Bottom'
+  $buttonPanel.Padding = New-Object System.Windows.Forms.Padding(6)
 
-if (-not $PSBoundParameters.ContainsKey('UPNSuffix') -or [string]::IsNullOrWhiteSpace($UPNSuffix)) {
-  $upnPrompt = Show-GuiInputDialog -Title 'UPN Suffix' -Prompt ("UPN domain suffix. Press OK to use {0}." -f $DNSRoot) -DefaultText $DNSRoot
-  if ([string]::IsNullOrWhiteSpace($upnPrompt)) {
-    $UPNSuffix = $DNSRoot
-  } else {
-    $UPNSuffix = $upnPrompt.Trim()
-  }
-} else {
-  $UPNSuffix = $UPNSuffix.Trim()
-}
+  $runButton = New-Object System.Windows.Forms.Button
+  $runButton.Text = 'Run Provisioning'
+  $runButton.Width = 150
+  $runButton.Height = 32
 
-if (-not $PSBoundParameters.ContainsKey('CsvPath')) {
-  $importDecision = [System.Windows.Forms.MessageBox]::Show('Would you like to import users from a CSV file now?','CSV Import',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question)
-  if ($importDecision -eq [System.Windows.Forms.DialogResult]::Yes) {
-    $selectedCsv = Show-GuiFilePicker -Title 'Select CSV file for user import'
-    while ($selectedCsv -and -not (Test-Path -LiteralPath $selectedCsv)) {
-      [void][System.Windows.Forms.MessageBox]::Show(('CSV not found: {0}' -f $selectedCsv),'CSV Import',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)
-      $selectedCsv = Show-GuiFilePicker -Title 'Select CSV file for user import'
+  $cancelButton = New-Object System.Windows.Forms.Button
+  $cancelButton.Text = 'Cancel'
+  $cancelButton.Width = 100
+  $cancelButton.Height = 32
+  $cancelButton.Add_Click({
+    $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.Close()
+  })
+
+  $buttonPanel.Controls.Add($runButton)
+  $buttonPanel.Controls.Add($cancelButton)
+
+  $form.Controls.Add($layout)
+  $form.Controls.Add($buttonPanel)
+
+  $resultObject = $null
+
+  $runButton.Add_Click({
+    $departments = ConvertTo-DepartmentList -Text $deptBox.Text
+    if ($departments.Count -lt 5) {
+      [System.Windows.Forms.MessageBox]::Show('Please provide at least five department names.','Validation', 'OK', 'Error') | Out-Null
+      return
     }
-    if ($selectedCsv) {
-      $CsvPath = $selectedCsv
+
+    $resultObject = [pscustomobject]@{
+      ServerName              = if ([string]::IsNullOrWhiteSpace($serverBox.Text)) { $env:COMPUTERNAME } else { $serverBox.Text.Trim() }
+      BasePath                = if ([string]::IsNullOrWhiteSpace($baseBox.Text)) { 'C:\\Shares' } else { $baseBox.Text.Trim() }
+      Departments             = $departments
+      DefaultPassword         = if ([string]::IsNullOrWhiteSpace($passwordBox.Text)) { 'Red.vine1' } else { $passwordBox.Text }
+      CsvPath                 = if ([string]::IsNullOrWhiteSpace($csvBox.Text)) { $null } else { $csvBox.Text.Trim() }
+      UPNSuffix               = if ([string]::IsNullOrWhiteSpace($upnBox.Text)) { $DNSRoot } else { $upnBox.Text.Trim() }
+      AltAdminDisplayName     = if ([string]::IsNullOrWhiteSpace($altDisplay.Text)) { $null } else { $altDisplay.Text.Trim() }
+      AltAdminSamAccountName  = if ([string]::IsNullOrWhiteSpace($altSam.Text)) { $null } else { $altSam.Text.Trim() }
+      AltAdminPassword        = if ([string]::IsNullOrWhiteSpace($altPass.Text)) { $null } else { $altPass.Text }
+      SkipFoldersAndShares    = $skipShares.Checked
+      SkipAclForDepartments   = $skipAcl.Checked
     }
+
+    $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.Close()
+  })
+
+  $form.AcceptButton = $runButton
+  $form.CancelButton = $cancelButton
+
+  $dialogResult = $form.ShowDialog()
+  if ($dialogResult -ne [System.Windows.Forms.DialogResult]::OK) {
+    return $null
   }
-} elseif ($CsvPath) {
-  $CsvPath = $CsvPath.Trim()
+
+  return $resultObject
 }
 
-if (-not [string]::IsNullOrWhiteSpace($CsvPath)) {
-  if (-not (Test-Path -LiteralPath $CsvPath)) {
-    throw ("CSV not found: {0}" -f $CsvPath)
-  }
-} else {
-  $CsvPath = $null
-}
+# ---------------------------------------------------------------------------
+# Core provisioning helper functions
+# ---------------------------------------------------------------------------
 
-# Summarize the runtime context so the operator can confirm the selections.
-Write-Host "Domain: $DNSRoot  |  DN: $DomainDN  |  NetBIOS: $NetBIOS" -ForegroundColor Cyan
-Write-Host "Server for shares: $ServerName" -ForegroundColor Cyan
-Write-Host "Base path: $BasePath" -ForegroundColor Cyan
-Write-Host "Departments: $($Departments -join ', ')" -ForegroundColor Cyan
-Write-Host
-
-$adServerParams = @{}
-if (-not [string]::IsNullOrWhiteSpace($DC)) {
-  $adServerParams['Server'] = $DC
-}
-
-# Cache any custom department -> group mappings to keep naming flexible.
-$DeptNameMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
-
-function Resolve-DeptGroupName {
-  param([Parameter(Mandatory)][string]$Department)
-  if ($DeptNameMap.ContainsKey($Department)) {
-    return $DeptNameMap[$Department]
-  }
-  return $Department
-}
-
-# Ensure the provided directory exists, creating it when missing.
 function Ensure-Directory {
+  <#
+    .SYNOPSIS
+      Creates a directory when it does not already exist and logs the action.
+  #>
   param([Parameter(Mandatory)][string]$Path)
 
-  $resolvedPath = Resolve-AbsolutePath -Path $Path
-
-  if (-not (Test-Path -LiteralPath $resolvedPath)) {
-    New-Item -ItemType Directory -Path $resolvedPath -Force | Out-Null
-    Write-Host ("Created folder: {0}" -f $resolvedPath) -ForegroundColor Green
+  if (-not (Test-Path -LiteralPath $Path)) {
+    New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    Write-Log "Created folder: $Path" -Color Cyan
   } else {
-    Write-Host ("Folder already exists: {0}" -f $resolvedPath) -ForegroundColor Cyan
+    Write-Log "Folder already exists: $Path" -Color DarkCyan
   }
 }
 
-# Run icacls with consistent logging and error capture.
-function Invoke-IcaclsCommand {
-  param(
-    [Parameter(Mandatory)][string[]]$Arguments,
-    [string]$Description,
-    [switch]$Quiet
-  )
-
-  $global:LASTEXITCODE = 0
-  $output = & icacls @Arguments 2>&1
-  $success = $LASTEXITCODE -eq 0
-  if (-not $success -and -not $Quiet) {
-    $message = if ($Description) { "Failed to update ACL ($Description): $($output -join ' ')" } else { "Failed to update ACL: $($output -join ' ')" }
-    Write-Warning $message
-  }
-
-  return [pscustomobject]@{
-    Success = $success
-    Output  = $output
-  }
-}
-
-# Build a list of SAM names and SID fallbacks for ACL operations.
-function Get-IcaclsPrincipalCandidates {
-  param(
-    [string]$SamAccountName,
-    [object]$SidValue
-  )
-
-  $candidates = New-Object System.Collections.Generic.List[string]
-
-  if (-not [string]::IsNullOrWhiteSpace($SamAccountName)) {
-    $candidates.Add(('{0}\{1}' -f $NetBIOS,$SamAccountName.Trim())) | Out-Null
-  }
-
-  if ($SidValue) {
-    $sidObjects = @()
-
-    if ($SidValue -is [System.Collections.IEnumerable] -and -not ($SidValue -is [string])) {
-      foreach ($sidEntry in $SidValue) {
-        if ($sidEntry) { $sidObjects += $sidEntry }
-      }
-    } else {
-      $sidObjects = @($SidValue)
-    }
-
-    foreach ($sidObj in $sidObjects) {
-      if (-not $sidObj) { continue }
-
-      $sidString = $null
-      if ($sidObj -is [System.Security.Principal.SecurityIdentifier]) {
-        $sidString = $sidObj.Value
-      } else {
-        $sidString = [string]$sidObj
-      }
-
-      if (-not [string]::IsNullOrWhiteSpace($sidString)) {
-        $sidString = $sidString.Trim()
-        $sidParts = $sidString -split '\s+' | Where-Object { $_ }
-        foreach ($sidPart in $sidParts) {
-          $candidates.Add(('*{0}' -f $sidPart)) | Out-Null
-        }
-      }
-    }
-  }
-
-  return $candidates.ToArray()
-}
-
-# Attempt to grant an ACL entry using each candidate principal in turn.
-function Grant-IcaclsPermission {
-  param(
-    [Parameter(Mandatory)][string]$Path,
-    [Parameter(Mandatory)][string[]]$PrincipalCandidates,
-    [Parameter(Mandatory)][string]$AccessRule,
-    [string]$Description
-  )
-
-  if (-not $PrincipalCandidates -or $PrincipalCandidates.Count -eq 0) {
-    return $false
-  }
-
-  $lastFailure = $null
-
-  foreach ($principal in $PrincipalCandidates) {
-    if ([string]::IsNullOrWhiteSpace($principal)) { continue }
-    $rule = '{0}:{1}' -f $principal,$AccessRule
-    $result = Invoke-IcaclsCommand -Arguments @($Path,'/grant',$rule) -Description $Description -Quiet
-    if ($result.Success) {
-      return $true
-    }
-    $lastFailure = $result
-  }
-
-  if ($lastFailure) {
-    $principalList = ($PrincipalCandidates | Where-Object { $_ }) -join ', '
-    $details = if ($lastFailure.Output) { $lastFailure.Output -join ' ' } else { 'No output from icacls.' }
-    if ($Description) {
-      Write-Warning ("Failed to update ACL ({0}). Tried: {1}. Details: {2}" -f $Description,$principalList,$details)
-    } else {
-      Write-Warning ("Failed to update ACL. Tried: {0}. Details: {1}" -f $principalList,$details)
-    }
-  }
-
-  return $false
-}
-
-# Ensure the SMB share exists with Everyone:Full share permissions.
 function Ensure-Share {
+  <#
+    .SYNOPSIS
+      Creates or updates an SMB share with Everyone:Full access.
+  #>
   param(
     [Parameter(Mandatory)][string]$Name,
     [Parameter(Mandatory)][string]$Path
   )
 
-  $resolvedPath = Resolve-AbsolutePath -Path $Path
   $existing = Get-SmbShare -Name $Name -ErrorAction SilentlyContinue
   if (-not $existing) {
     try {
-      New-SmbShare -Name $Name -Path $resolvedPath -FullAccess 'Everyone' -ErrorAction Stop | Out-Null
-      Write-Host ("Created SMB share: {0} -> {1} (Everyone: Full Control)" -f $Name,$resolvedPath) -ForegroundColor Green
+      New-SmbShare -Name $Name -Path $Path -FullAccess 'Everyone' | Out-Null
+      Write-Log "Created SMB share: $Name -> $Path (Everyone: Full Control)" -Color Cyan
     } catch {
-      $postCheck = Get-SmbShare -Name $Name -ErrorAction SilentlyContinue
-      if ($postCheck) {
-        Write-Host ("SMB share already exists: {0} (Everyone: Full Control verified)" -f $Name) -ForegroundColor Cyan
-      } else {
-        Write-Warning ("Failed to create SMB share '{0}': {1}" -f $Name,$_.Exception.Message)
-      }
+      Write-Log "FAILED to create SMB share '$Name': $($_.Exception.Message)" -Color Red
     }
   } else {
     Grant-SmbShareAccess -Name $Name -AccountName 'Everyone' -AccessRight Full -Force -ErrorAction SilentlyContinue | Out-Null
-    Write-Host ("SMB share already exists: {0} (Everyone: Full Control verified)" -f $Name) -ForegroundColor Cyan
+    Write-Log "Verified SMB share: $Name (Everyone: Full Control)" -Color DarkCyan
   }
 }
 
-# Ensure the Organizational Unit exists (idempotent creation).
 function Ensure-OU {
+  <#
+    .SYNOPSIS
+      Ensures an Organizational Unit exists beneath the domain root.
+  #>
   param([Parameter(Mandatory)][string]$OuName)
-  $ouLookupParams = @{ LDAPFilter = "(ou=$OuName)"; SearchBase = $DomainDN; ErrorAction = 'SilentlyContinue' }
-  $ouLookupParams += $adServerParams
-  $ou = Get-ADOrganizationalUnit @ouLookupParams
+
+  $ou = Get-ADOrganizationalUnit -LDAPFilter "(ou=$OuName)" -SearchBase $DomainDN -ErrorAction SilentlyContinue
   if (-not $ou) {
-    try {
-      $newOuParams = @{ Name = $OuName; Path = $DomainDN; ProtectedFromAccidentalDeletion = $false }
-      $newOuParams += $adServerParams
-      New-ADOrganizationalUnit @newOuParams | Out-Null
-      Write-Host ("Created OU: {0}" -f $OuName) -ForegroundColor Green
-    } catch {
-      $ou = Get-ADOrganizationalUnit @ouLookupParams
-      if ($ou) {
-        Write-Host ("OU already exists: {0}" -f $OuName) -ForegroundColor Cyan
-      } else {
-        Write-Warning ("Failed to create OU '{0}': {1}" -f $OuName,$_.Exception.Message)
-      }
-    }
+    New-ADOrganizationalUnit -Name $OuName -Path $DomainDN -ProtectedFromAccidentalDeletion:$false -Server $DC | Out-Null
+    Write-Log "Created OU: $OuName" -Color Cyan
   } else {
-    Write-Host ("OU already exists: {0}" -f $OuName) -ForegroundColor Cyan
+    Write-Log "OU already exists: $OuName" -Color DarkCyan
   }
 }
 
-# Ensure the departmental global security group exists under the OU.
 function Ensure-Group {
+  <#
+    .SYNOPSIS
+      Ensures a global security group exists inside a specific OU.
+  #>
   param(
     [Parameter(Mandatory)][string]$GroupCN,
     [Parameter(Mandatory)][string]$OuName
   )
+
   $ouPath = "OU=$OuName,$DomainDN"
-  $grpLookupParams = @{ LDAPFilter = "(cn=$GroupCN)"; SearchBase = $ouPath; ErrorAction = 'SilentlyContinue' }
-  $grpLookupParams += $adServerParams
-  $grp = Get-ADGroup @grpLookupParams
+  $grp = Get-ADGroup -LDAPFilter "(cn=$GroupCN)" -SearchBase $ouPath -ErrorAction SilentlyContinue
   if (-not $grp) {
-    try {
-      $newGroupParams = @{ Name = $GroupCN; SamAccountName = $GroupCN; GroupCategory = 'Security'; GroupScope = 'Global'; Path = $ouPath }
-      $newGroupParams += $adServerParams
-      New-ADGroup @newGroupParams | Out-Null
-      Write-Host ("Created Group: {0}  (in OU={1})" -f $GroupCN,$OuName) -ForegroundColor Green
-    } catch {
-      $grp = Get-ADGroup @grpLookupParams
-      if ($grp) {
-        Write-Host ("Group already exists: {0}  (in OU={1})" -f $GroupCN,$OuName) -ForegroundColor Cyan
-      } else {
-        Write-Warning ("Failed to create group '{0}' in OU '{1}': {2}" -f $GroupCN,$OuName,$_.Exception.Message)
-      }
-    }
+    New-ADGroup -Name $GroupCN -SamAccountName $GroupCN -GroupCategory Security -GroupScope Global -Path $ouPath -Server $DC | Out-Null
+    Write-Log "Created Group: $GroupCN (OU=$OuName)" -Color Cyan
   } else {
-    Write-Host ("Group already exists: {0}  (in OU={1})" -f $GroupCN,$OuName) -ForegroundColor Cyan
+    Write-Log "Group already exists: $GroupCN (OU=$OuName)" -Color DarkCyan
   }
 }
 
-# Produce a unique sAMAccountName (<=20 chars) within the domain.
 function New-UniqueSam {
+  <#
+    .SYNOPSIS
+      Generates a unique sAMAccountName within the domain (<=20 characters).
+  #>
   param([Parameter(Mandatory)][string]$Base)
+
   $b = ($Base -replace '[^A-Za-z0-9]','').ToLower()
-  if ($b.Length -gt 20) {
-    $b = $b.Substring(0,20)
-  }
+  if ($b.Length -gt 20) { $b = $b.Substring(0,20) }
+  if (-not $b) { $b = 'user' }
+
   $candidate = $b
   $i = 1
-  $userLookupParams = @{ LDAPFilter = "(sAMAccountName=$candidate)"; SearchBase = $DomainDN; ErrorAction = 'SilentlyContinue' }
-  $userLookupParams += $adServerParams
-  while (Get-ADUser @userLookupParams) {
+  while (Get-ADUser -LDAPFilter "(sAMAccountName=$candidate)" -SearchBase $DomainDN -ErrorAction SilentlyContinue) {
     $suffix = $i.ToString()
-    $maxBase = 20 - $suffix.Length
-    if ($b.Length -gt $maxBase) {
-      $candidate = $b.Substring(0,$maxBase) + $suffix
-    } else {
-      $candidate = $b + $suffix
-    }
+    $maxLen = 20 - $suffix.Length
+    if ($maxLen -lt 1) { $maxLen = 1 }
+    $candidate = if ($b.Length -gt $maxLen) { $b.Substring(0,$maxLen) + $suffix } else { $b + $suffix }
     $i++
-    $userLookupParams['LDAPFilter'] = "(sAMAccountName=$candidate)"
   }
+
   return $candidate
 }
 
+function Get-PrincipalCandidates {
+  <#
+    .SYNOPSIS
+      Builds candidate identifiers (SAM + SID) for icacls permission grants.
+  #>
+  param([Parameter(Mandatory)]$AdObject)
+
+  $candidates = New-Object System.Collections.Generic.List[string]
+
+  if ($AdObject -and $AdObject.SamAccountName) {
+    $candidates.Add(('{0}\{1}' -f $NetBIOS, $AdObject.SamAccountName.Trim())) | Out-Null
+  }
+
+  if ($AdObject -and $AdObject.SID) {
+    $sidValue = $AdObject.SID.Value
+    if ($sidValue) { $candidates.Add("*$sidValue") | Out-Null }
+  }
+
+  return $candidates.ToArray()
+}
+
+function Invoke-IcaclsGrant {
+  <#
+    .SYNOPSIS
+      Attempts to grant permissions using icacls with multiple identity options.
+  #>
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$RuleTemplate,
+    [Parameter(Mandatory)][string[]]$Candidates,
+    [string]$Description
+  )
+
+  $errors = @()
+  foreach ($candidate in $Candidates) {
+    $rule = $RuleTemplate -f $candidate
+    $result = & icacls $Path /grant $rule 2>&1
+    if ($LASTEXITCODE -eq 0) {
+      return $true
+    }
+    $errors += $result
+  }
+
+  if ($errors.Count -gt 0) {
+    Write-Log "WARNING: Failed to update ACL ($Description). Tried: $([string]::Join(', ', $Candidates)). Details: $([string]::Join(' ', $errors))" -Color Yellow
+  }
+
+  return $false
+}
+
+function Invoke-IcaclsReset {
+  <#
+    .SYNOPSIS
+      Resets inheritance and removes BUILTIN\Users from a directory.
+  #>
+  param([Parameter(Mandatory)][string]$Path)
+
+  & icacls $Path /inheritance:r | Out-Null
+  & icacls $Path /remove 'BUILTIN\Users' 2>$null | Out-Null
+}
+
+# ---------------------------------------------------------------------------
+# Department ACL application
+# ---------------------------------------------------------------------------
+
+function Set-DepartmentAcl {
+  <#
+    .SYNOPSIS
+      Applies the standard department ACL matrix to a folder.
+  #>
+  param(
+    [Parameter(Mandatory)][string]$Folder,
+    [Parameter(Mandatory)][string]$Department,
+    [Parameter(Mandatory)]$DepartmentGroup,
+    [Parameter(Mandatory)]$ItGroup,
+    $ExecutivesGroup,
+    $ManagementGroup
+  )
+
+  Invoke-IcaclsReset -Path $Folder
+
+  & icacls $Folder /grant 'NT AUTHORITY\SYSTEM:(OI)(CI)F' | Out-Null
+  & icacls $Folder /grant 'BUILTIN\Administrators:(OI)(CI)F' | Out-Null
+
+  $deptCandidates = Get-PrincipalCandidates -AdObject $DepartmentGroup
+  Invoke-IcaclsGrant -Path $Folder -RuleTemplate '{0}:(OI)(CI)F' -Candidates $deptCandidates -Description "Department full for $Department" | Out-Null
+
+  $itCandidates = Get-PrincipalCandidates -AdObject $ItGroup
+  Invoke-IcaclsGrant -Path $Folder -RuleTemplate '{0}:(OI)(CI)F' -Candidates $itCandidates -Description 'IT full control' | Out-Null
+
+  if ($Department -notmatch '^(?i)IT$') {
+    if ($ExecutivesGroup) {
+      $execCandidates = Get-PrincipalCandidates -AdObject $ExecutivesGroup
+      Invoke-IcaclsGrant -Path $Folder -RuleTemplate '{0}:(OI)(CI)RX' -Candidates $execCandidates -Description 'Executives read access' | Out-Null
+    }
+
+    if ($ManagementGroup) {
+      $mgmtCandidates = Get-PrincipalCandidates -AdObject $ManagementGroup
+      Invoke-IcaclsGrant -Path $Folder -RuleTemplate '{0}:(OI)(CI)RX' -Candidates $mgmtCandidates -Description 'Management read access' | Out-Null
+    }
+  }
+
+  Write-Log "NTFS set: $Folder" -Color DarkCyan
+}
+
+# ---------------------------------------------------------------------------
+# Alternate administrator provisioning
+# ---------------------------------------------------------------------------
+
 function Ensure-AlternateAdminAccount {
+  <#
+    .SYNOPSIS
+      Creates or updates an alternate administrative account.
+  #>
   param(
     [Parameter(Mandatory)][string]$DisplayName,
-    [Parameter(Mandatory)][string]$SamHint,
-    [Parameter(Mandatory)][System.Security.SecureString]$SecurePassword,
-    [Parameter(Mandatory)][string]$UpnSuffix,
-    [hashtable]$DepartmentGroupMap,
-    [string]$ItDepartment,
-    [string]$ItGroupName,
-    [hashtable]$ServerParams
+    [Parameter(Mandatory)][string]$SamAccountName,
+    [Parameter(Mandatory)][string]$Password,
+    [Parameter(Mandatory)][string]$ItDepartmentOu,
+    [Parameter(Mandatory)]$ItGroup
+  )
+
+  $secure = ConvertTo-SecureString $Password -AsPlainText -Force
+  $existing = Get-ADUser -Identity $SamAccountName -ErrorAction SilentlyContinue
+
+  if (-not $existing) {
+    New-ADUser -Name $DisplayName -SamAccountName $SamAccountName -UserPrincipalName "$SamAccountName@$DNSRoot" -AccountPassword $secure -Enabled $true -PasswordNeverExpires $false -ChangePasswordAtLogon $false -Path $ItDepartmentOu -Server $DC | Out-Null
+    Write-Log "Created alternate admin account: $SamAccountName" -Color Cyan
+    $existing = Get-ADUser -Identity $SamAccountName
+  } else {
+    Write-Log "Alternate admin already exists: $SamAccountName" -Color DarkCyan
+  }
+
+  try {
+    Add-ADGroupMember -Identity $ItGroup -Members $existing -Server $DC -ErrorAction SilentlyContinue
+  } catch {}
+
+  foreach ($adminGroup in @('Domain Admins','Administrators')) {
+    $grp = Get-ADGroup -Identity $adminGroup -ErrorAction SilentlyContinue
+    if ($grp) {
+      try {
+        Add-ADGroupMember -Identity $grp -Members $existing -Server $DC -ErrorAction SilentlyContinue
+      } catch {}
+    }
+  }
+
+  return $existing
+}
+
+# ---------------------------------------------------------------------------
+# CSV user import
+# ---------------------------------------------------------------------------
+
+function Import-UsersFromCsv {
+  <#
+    .SYNOPSIS
+      Imports users from a CSV file and provisions accounts, groups, and home folders.
+  #>
+  param(
+    [Parameter(Mandatory)][string]$CsvPath,
+    [Parameter(Mandatory)][string]$DefaultPassword,
+    [Parameter(Mandatory)][string]$ServerName,
+    [Parameter(Mandatory)][string]$BasePath,
+    [Parameter(Mandatory)][string[]]$Departments,
+    [Parameter(Mandatory)]$DeptGroupsMap,
+    [Parameter(Mandatory)]$ItGroup,
+    $ExecutivesGroup,
+    $ManagementGroup,
+    [Parameter(Mandatory)][string]$UpnSuffix
   )
 
   $result = [pscustomobject]@{
-    SamAccountName = $null
-    Created        = $false
-    TargetOu       = $DomainDN
-    GroupMessages  = New-Object System.Collections.Generic.List[string]
+    Created = 0
+    Updated = 0
+    Malformed = New-Object System.Collections.Generic.List[string]
   }
 
-  $nameTrimmed = $DisplayName.Trim()
-  if ([string]::IsNullOrWhiteSpace($nameTrimmed)) {
-    Write-Warning 'Alternate admin display name is blank; skipping creation.'
-    return $result
-  }
+  $securePwd = ConvertTo-SecureString $DefaultPassword -AsPlainText -Force
 
-  $samBase = $SamHint
-  if ([string]::IsNullOrWhiteSpace($samBase)) {
-    $samBase = ($nameTrimmed -replace '\s+', '')
-  }
-  $samBase = ($samBase -replace '[^A-Za-z0-9]','').ToLower()
-  if ([string]::IsNullOrWhiteSpace($samBase)) {
-    $samBase = 'labadmin'
-  }
-
-  $serverParamsLocal = @{}
-  if ($ServerParams) {
-    foreach ($key in $ServerParams.Keys) {
-      $serverParamsLocal[$key] = $ServerParams[$key]
-    }
-  }
-
-  $userLookupParams = @{ LDAPFilter = "(sAMAccountName=$samBase)"; SearchBase = $DomainDN; ErrorAction = 'SilentlyContinue'; Properties = 'SamAccountName','DistinguishedName','SID' }
-  $userLookupParams += $serverParamsLocal
-  $existingUser = Get-ADUser @userLookupParams
-
-  $finalSam = $samBase
-  if (-not $existingUser) {
-    $finalSam = New-UniqueSam $samBase
-  } else {
-    $finalSam = [string]$existingUser.SamAccountName
-  }
-
-  $result.SamAccountName = $finalSam
-
-  $givenName = $nameTrimmed
-  $surname   = $nameTrimmed
-  $nameParts = $nameTrimmed -split '\s+'
-  if ($nameParts.Count -gt 0) { $givenName = $nameParts[0] }
-  if ($nameParts.Count -gt 1) { $surname = $nameParts[-1] }
-
-  $targetOu = $DomainDN
-  if ($ItDepartment) {
-    $targetOu = "OU=$ItDepartment,$DomainDN"
-  }
-  $result.TargetOu = $targetOu
-
-  $adminUser = $existingUser
-  if (-not $adminUser) {
-    $adminUpn = '{0}@{1}' -f $finalSam,$UpnSuffix
-    $newAdminParams = @{ Name = $nameTrimmed; GivenName = $givenName; Surname = $surname; SamAccountName = $finalSam; UserPrincipalName = $adminUpn; Path = $targetOu; AccountPassword = $SecurePassword; Enabled = $true; ChangePasswordAtLogon = $false; ErrorAction = 'Stop' }
-    $newAdminParams += $serverParamsLocal
-    try {
-      New-ADUser @newAdminParams | Out-Null
-      Write-Host ("Created alternate admin account: {0}" -f $finalSam) -ForegroundColor Green
-      $result.Created = $true
-      $getAdminParams = @{ Identity = $finalSam; Properties = 'SamAccountName','DistinguishedName','SID' }
-      $getAdminParams += $serverParamsLocal
-      $adminUser = Get-ADUser @getAdminParams
-    } catch {
-      Write-Warning ("Failed to create alternate admin '{0}': {1}" -f $nameTrimmed,$_.Exception.Message)
-      return $result
-    }
-  } else {
-    Write-Host ("Alternate admin already exists: {0}" -f $finalSam) -ForegroundColor Cyan
-  }
-
-  if (-not $adminUser) {
-    Write-Warning ("Unable to locate alternate admin account '{0}' after creation attempt." -f $finalSam)
-    return $result
-  }
-
-  $enableParams = @{ Identity = $adminUser; ErrorAction = 'SilentlyContinue' }
-  $enableParams += $serverParamsLocal
-  try { Enable-ADAccount @enableParams } catch {}
-
-  $changeParams = @{ Identity = $adminUser; ChangePasswordAtLogon = $false; ErrorAction = 'SilentlyContinue' }
-  $changeParams += $serverParamsLocal
-  try { Set-ADUser @changeParams } catch {}
-
-  $groupTargets = New-Object System.Collections.Generic.List[pscustomobject]
-  if ($DepartmentGroupMap -and $ItDepartment -and $DepartmentGroupMap.ContainsKey($ItDepartment)) {
-    $itGroupInfo = $DepartmentGroupMap[$ItDepartment]
-    if ($itGroupInfo -and $itGroupInfo.DistinguishedName) {
-      $groupTargets.Add([pscustomobject]@{ Identity = $itGroupInfo.DistinguishedName; Label = $itGroupInfo.Name }) | Out-Null
-    }
-  } elseif ($ItGroupName) {
-    $groupTargets.Add([pscustomobject]@{ Identity = $ItGroupName; Label = $ItGroupName }) | Out-Null
-  }
-
-  $groupTargets.Add([pscustomobject]@{ Identity = 'Domain Admins'; Label = 'Domain Admins' }) | Out-Null
-  $groupTargets.Add([pscustomobject]@{ Identity = 'Administrators'; Label = 'Administrators' }) | Out-Null
-
-  $seenGroups = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-  foreach ($groupTarget in $groupTargets) {
-    if (-not $groupTarget) { continue }
-    $identityValue = [string]$groupTarget.Identity
-    if ([string]::IsNullOrWhiteSpace($identityValue)) { continue }
-    if (-not $seenGroups.Add($identityValue)) { continue }
-
-    $addGroupParams = @{ Identity = $identityValue; Members = $adminUser; ErrorAction = 'Stop' }
-    $addGroupParams += $serverParamsLocal
-    try {
-      Add-ADGroupMember @addGroupParams
-      $result.GroupMessages.Add(("Added to {0}" -f $groupTarget.Label)) | Out-Null
-    } catch {
-      if ($_.Exception.Message -match 'already a member') {
-        $result.GroupMessages.Add(("Already a member of {0}" -f $groupTarget.Label)) | Out-Null
-      } else {
-        Write-Warning ("Failed to add alternate admin to {0}: {1}" -f $groupTarget.Label,$_.Exception.Message)
-      }
-    }
-  }
-
-  return $result
-}
-
-# Capture special department names for ACL logic (IT, Executives, Management).
-$itDepartmentName   = ($Departments | Where-Object { $_ -match '^(?i)IT$' } | Select-Object -First 1)
-$execDepartmentName = ($Departments | Where-Object { $_ -match '^(?i)Executives$' } | Select-Object -First 1)
-$mgmtDepartmentName = ($Departments | Where-Object { $_ -match '^(?i)Management$' } | Select-Object -First 1)
-
-if ($itDepartmentName) {
-  $itDepartmentName = [string]$itDepartmentName
-  $itGroupName = Resolve-DeptGroupName -Department $itDepartmentName
-} else {
-  $itDepartmentName = $null
-  $itGroupName = $null
-}
-
-if ($execDepartmentName) {
-  $execDepartmentName = [string]$execDepartmentName
-  $execGroupName = Resolve-DeptGroupName -Department $execDepartmentName
-} else {
-  $execDepartmentName = $null
-  $execGroupName = $null
-}
-
-if ($mgmtDepartmentName) {
-  $mgmtDepartmentName = [string]$mgmtDepartmentName
-  $mgmtGroupName = Resolve-DeptGroupName -Department $mgmtDepartmentName
-} else {
-  $mgmtDepartmentName = $null
-  $mgmtGroupName = $null
-}
-
-# Build the share and folder structure when not explicitly skipped.
-if (-not $SkipFoldersAndShares) {
-  Ensure-Directory -Path $BasePath
-  $homePath = Join-Path -Path $BasePath -ChildPath 'Home'
-  $profilesPath = Join-Path -Path $BasePath -ChildPath 'Profiles'
-  Ensure-Directory -Path $homePath
-  Ensure-Directory -Path $profilesPath
-  Ensure-Share -Name 'Home' -Path $homePath
-  Ensure-Share -Name 'Profiles' -Path $profilesPath
-
-  foreach ($dept in $Departments) {
-    $folder = Join-Path -Path $BasePath -ChildPath $dept
-    Ensure-Directory -Path $folder
-    Ensure-Share -Name $dept -Path $folder
-  }
-}
-
-# Ensure every department has a matching OU and group structure.
-foreach ($dept in $Departments) {
-  Ensure-OU $dept
-  $grpCN = Resolve-DeptGroupName -Department $dept
-  Ensure-Group $grpCN $dept
-}
-
-# Resolve department groups once so later lookups do not repeat LDAP queries.
-$deptGroupMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($dept in $Departments) {
-  $grpCN = Resolve-DeptGroupName -Department $dept
-  $deptGroupLookup = @{ LDAPFilter = "(cn=$grpCN)"; SearchBase = "OU=$dept,$DomainDN"; ErrorAction = 'SilentlyContinue' }
-  $deptGroupLookup += $adServerParams
-  $deptGroupObj = Get-ADGroup @deptGroupLookup -Properties SID,SamAccountName
-  if ($deptGroupObj) {
-    $deptGroupMap[$dept] = [pscustomobject]@{
-      Name = $grpCN
-      Sam  = if ($deptGroupObj.SamAccountName) { [string]$deptGroupObj.SamAccountName } else { $grpCN }
-      Sid  = if ($deptGroupObj.SID) { $deptGroupObj.SID.Value } else { $null }
-      DistinguishedName = $deptGroupObj.DistinguishedName
-    }
-  }
-}
-
-# Ensure the alternate administrative account exists and has elevated memberships.
-$alternateAdminSummary = Ensure-AlternateAdminAccount -DisplayName $AltAdminDisplayName -SamHint $AltAdminSamAccountName -SecurePassword $AltAdminSecurePwd -UpnSuffix $UPNSuffix -DepartmentGroupMap $deptGroupMap -ItDepartment $itDepartmentName -ItGroupName $itGroupName -ServerParams $adServerParams
-
-# Lookup special security groups to reuse their SIDs for ACL grants.
-$itGroupObject = $null
-if ($itGroupName) {
-  $itLookup = @{ Identity = $itGroupName; ErrorAction = 'SilentlyContinue'; Properties = 'SID','SamAccountName' }
-  $itLookup += $adServerParams
-  $itGroupObject = Get-ADGroup @itLookup
-}
-
-$itAclCandidates = @()
-if ($itGroupObject) {
-  $itSamResolved = if ($itGroupObject.SamAccountName) { [string]$itGroupObject.SamAccountName } else { $itGroupName }
-  $itSidResolved = if ($itGroupObject.SID) { $itGroupObject.SID.Value } else { $null }
-  $itAclCandidates = Get-IcaclsPrincipalCandidates -SamAccountName $itSamResolved -SidValue $itSidResolved
-}
-
-$execGroupObject = $null
-if ($execGroupName) {
-  $execLookup = @{ Identity = $execGroupName; ErrorAction = 'SilentlyContinue'; Properties = 'SID','SamAccountName' }
-  $execLookup += $adServerParams
-  $execGroupObject = Get-ADGroup @execLookup
-}
-
-$execAclCandidates = @()
-if ($execGroupObject) {
-  $execSamResolved = if ($execGroupObject.SamAccountName) { [string]$execGroupObject.SamAccountName } else { $execGroupName }
-  $execSidResolved = if ($execGroupObject.SID) { $execGroupObject.SID.Value } else { $null }
-  $execAclCandidates = Get-IcaclsPrincipalCandidates -SamAccountName $execSamResolved -SidValue $execSidResolved
-}
-
-$mgmtGroupObject = $null
-if ($mgmtGroupName) {
-  $mgmtLookup = @{ Identity = $mgmtGroupName; ErrorAction = 'SilentlyContinue'; Properties = 'SID','SamAccountName' }
-  $mgmtLookup += $adServerParams
-  $mgmtGroupObject = Get-ADGroup @mgmtLookup
-}
-
-$mgmtAclCandidates = @()
-if ($mgmtGroupObject) {
-  $mgmtSamResolved = if ($mgmtGroupObject.SamAccountName) { [string]$mgmtGroupObject.SamAccountName } else { $mgmtGroupName }
-  $mgmtSidResolved = if ($mgmtGroupObject.SID) { $mgmtGroupObject.SID.Value } else { $null }
-  $mgmtAclCandidates = Get-IcaclsPrincipalCandidates -SamAccountName $mgmtSamResolved -SidValue $mgmtSidResolved
-}
-
-# Apply default NTFS permissions across departmental folders.
-if (-not $SkipAclForDepartments) {
-  Write-Host "`nApplying department NTFS ACLs..." -ForegroundColor Yellow
-  foreach ($dept in $Departments) {
-    $folder = Join-Path $BasePath $dept
-    if (-not (Test-Path -LiteralPath $folder)) {
-      continue
-    }
-    $grpCN = Resolve-DeptGroupName -Department $dept
-    $deptGroup = $null
-    if ($deptGroupMap.ContainsKey($dept)) {
-      $deptGroup = $deptGroupMap[$dept]
-    }
-
-    $deptPrincipalCandidates = @()
-    if ($deptGroup) {
-      $deptPrincipalCandidates = Get-IcaclsPrincipalCandidates -SamAccountName $deptGroup.Sam -SidValue $deptGroup.Sid
-    }
-
-    Invoke-IcaclsCommand -Arguments @($folder,'/inheritance:r') | Out-Null
-    Invoke-IcaclsCommand -Arguments @($folder,'/grant','NT AUTHORITY\SYSTEM:(OI)(CI)F') -Description "SYSTEM full" | Out-Null
-    Invoke-IcaclsCommand -Arguments @($folder,'/grant','BUILTIN\Administrators:(OI)(CI)F') -Description "Administrators full" | Out-Null
-    if ($itAclCandidates.Count -gt 0) {
-      Grant-IcaclsPermission -Path $folder -PrincipalCandidates $itAclCandidates -AccessRule '(OI)(CI)F' -Description 'IT full' | Out-Null
-    } elseif ($itGroupName) {
-      Write-Host ("IT group missing, skipped NTFS grant for: {0}" -f $itGroupName) -ForegroundColor Yellow
-    }
-    if ($deptPrincipalCandidates.Count -gt 0) {
-      Grant-IcaclsPermission -Path $folder -PrincipalCandidates $deptPrincipalCandidates -AccessRule '(OI)(CI)F' -Description ("{0} full" -f $grpCN) | Out-Null
-    } else {
-      Write-Host ("Department group missing, skipped NTFS grant for: {0}" -f $grpCN) -ForegroundColor Yellow
-    }
-
-    $isItFolder = $false
-    if ($itDepartmentName) {
-      if ([string]::Equals($dept,$itDepartmentName,[System.StringComparison]::OrdinalIgnoreCase)) {
-        $isItFolder = $true
-      }
-    }
-
-    if (-not $isItFolder) {
-      if ($execAclCandidates.Count -gt 0) {
-        Grant-IcaclsPermission -Path $folder -PrincipalCandidates $execAclCandidates -AccessRule '(OI)(CI)RX' -Description 'Executives read' | Out-Null
-      } elseif ($execGroupName) {
-        Write-Host ("Executives group missing, skipped NTFS grant for: {0}" -f $execGroupName) -ForegroundColor Yellow
-      }
-      if ($mgmtAclCandidates.Count -gt 0) {
-        Grant-IcaclsPermission -Path $folder -PrincipalCandidates $mgmtAclCandidates -AccessRule '(OI)(CI)RX' -Description 'Management read' | Out-Null
-      } elseif ($mgmtGroupName) {
-        Write-Host ("Management group missing, skipped NTFS grant for: {0}" -f $mgmtGroupName) -ForegroundColor Yellow
-      }
-    }
-
-    Invoke-IcaclsCommand -Arguments @($folder,'/remove','BUILTIN\Users') -Description 'Remove BUILTIN\Users' | Out-Null
-    Write-Host ("  NTFS set: {0}" -f $folder) -ForegroundColor Green
-  }
-}
-
-# Load CSV rows only when an import file is supplied.
-$rows = @()
-if ($CsvPath) {
   $rows = Import-Csv -LiteralPath $CsvPath
-}
-
-$createdUsers = 0
-$updatedUsers = 0
-$malformedLogPath = $null
-
-# Import users when rows are present in the CSV.
-if ($rows.Count -gt 0) {
-  $bad = New-Object System.Collections.Generic.List[string]
-
-  Write-Host "`nImporting users..." -ForegroundColor Yellow
-
-  $headers  = $rows[0].psobject.Properties.Name
-  $FullHdr  = ($headers | Where-Object { $_ -match '^(FullName|Name)$' } | Select-Object -First 1)
-  $FirstHdr = ($headers | Where-Object { $_ -match '^(FirstName|First Name|GivenName|Given Name|FName)$' } | Select-Object -First 1)
-  $LastHdr  = ($headers | Where-Object { $_ -match '^(LastName|Last Name|Surname|Sur Name|LName)$' } | Select-Object -First 1)
-
-  if (-not $FullHdr -and (-not $FirstHdr -or -not $LastHdr)) {
-    $firstHeader = $headers | Select-Object -First 1
-    if ($firstHeader) {
-      $FullHdr = [string]$firstHeader
-      Write-Host ("Treating column '{0}' as FullName (fallback)." -f $FullHdr) -ForegroundColor Cyan
-    } else {
-      throw 'CSV must have FullName OR First/Last columns.'
-    }
+  if (-not $rows -or $rows.Count -eq 0) {
+    throw "CSV is empty: $CsvPath"
   }
+
+  $headers = $rows[0].psobject.Properties.Name
+  $fullHdr  = ($headers | Where-Object { $_ -match '^(FullName|Name)$' } | Select-Object -First 1)
+  $firstHdr = ($headers | Where-Object { $_ -match '^(FirstName|First Name|GivenName|Given Name|FName)$' } | Select-Object -First 1)
+  $lastHdr  = ($headers | Where-Object { $_ -match '^(LastName|Last Name|Surname|Sur Name|LName)$' }  | Select-Object -First 1)
+
+  if (-not $fullHdr -and (-not $firstHdr -or -not $lastHdr)) {
+    throw 'CSV must have FullName OR First/Last columns.'
+  }
+
+  Write-Log "Importing users from $CsvPath ..." -Color Yellow
 
   foreach ($row in $rows) {
     $First = $null
     $Last  = $null
 
-    if ($FullHdr) {
-      $fullValue = ([string]$row.$FullHdr).Trim()
-      if (-not $fullValue) {
-        continue
-      }
-      $parts = $fullValue -split '\s+'
+    if ($fullHdr) {
+      $raw = ([string]$row.$fullHdr).Trim()
+      if (-not $raw) { continue }
+      $parts = $raw -split '\s+'
       if ($parts.Count -lt 2) {
-        $bad.Add($fullValue)
+        $result.Malformed.Add($raw) | Out-Null
         continue
       }
       $First = $parts[0]
       $Last  = $parts[-1]
     } else {
-      $First = [string]$row.$FirstHdr
-      $Last  = [string]$row.$LastHdr
+      $First = [string]$row.$firstHdr
+      $Last  = [string]$row.$lastHdr
       if ([string]::IsNullOrWhiteSpace($First) -or [string]::IsNullOrWhiteSpace($Last)) {
-        $bad.Add("$First $Last")
+        $result.Malformed.Add("$First $Last") | Out-Null
         continue
       }
       $First = $First.Trim()
       $Last  = $Last.Trim()
     }
 
-    $baseSam = if ($First.Length -gt 0) { $First.Substring(0,1) + $Last } else { $Last }
-    $sam = New-UniqueSam $baseSam
-    if (-not $sam) {
-      $bad.Add("$First $Last")
-      continue
-    }
+    $baseSam = ($First.Substring(0,1) + $Last)
+    $sam = New-UniqueSam -Base $baseSam
+    $upn = "$sam@$UpnSuffix"
 
-    $upn = "$sam@$UPNSuffix"
-    $dept = Get-Random $Departments
+    $dept = Get-Random -InputObject $Departments
     $ouPath = "OU=$dept,$DomainDN"
-    $grpCN = Resolve-DeptGroupName -Department $dept
-    $groupDn = "CN=$grpCN,$ouPath"
-    if ($deptGroupMap.ContainsKey($dept)) {
-      $groupDn = $deptGroupMap[$dept].DistinguishedName
-    }
+    $deptGroup = $DeptGroupsMap[$dept]
 
-    $userObj = $null
-    try {
-      $newUserParams = @{ Name = ("{0} {1}" -f $First,$Last); GivenName = $First; Surname = $Last; SamAccountName = $sam; UserPrincipalName = $upn; Path = $ouPath; AccountPassword = $SecurePwd; Enabled = $true; ChangePasswordAtLogon = $true; ErrorAction = 'Stop' }
-      $newUserParams += $adServerParams
-      New-ADUser @newUserParams
+    $userObj = Get-ADUser -Identity $sam -ErrorAction SilentlyContinue
 
-      $getUserParams = @{ Identity = $sam; Properties = 'SID','SamAccountName' }
-      $getUserParams += $adServerParams
-      $userObj = Get-ADUser @getUserParams
-      $createdUsers++
-    } catch {
-      if ($_.Exception.Message -match 'already in use' -or $_.FullyQualifiedErrorId -match 'ActiveDirectoryServer:8305') {
-        $fullName = "{0} {1}" -f $First,$Last
-        $escapedFullName = $fullName.Replace("'","''")
-        $existingUserParams = @{ Filter = "Name -eq '$escapedFullName'"; SearchBase = $DomainDN; ErrorAction = 'SilentlyContinue'; Properties = 'SID','SamAccountName' }
-        $existingUserParams += $adServerParams
-        $userObj = Get-ADUser @existingUserParams
-        if ($userObj) {
-          $updatedUsers++
-        } else {
-          Write-Warning ("Duplicate CN but user not found: {0} {1}" -f $First,$Last)
-          continue
-        }
-      } else {
-        Write-Warning ("Failed to create '{0} {1}': {2}" -f $First,$Last,$_.Exception.Message)
+    if (-not $userObj) {
+      try {
+        New-ADUser -Name "$First $Last" -GivenName $First -Surname $Last -SamAccountName $sam -UserPrincipalName $upn -Path $ouPath -AccountPassword $securePwd -Enabled $true -ChangePasswordAtLogon $true -Server $DC | Out-Null
+        $result.Created++
+        Write-Log "Created user: $sam ($First $Last) -> $dept" -Color Green
+      } catch {
+        Write-Log "Failed to create user $First $Last: $($_.Exception.Message)" -Color Red
+        $result.Malformed.Add("$First $Last (creation failed)") | Out-Null
         continue
       }
+      $userObj = Get-ADUser -Identity $sam -ErrorAction SilentlyContinue
+    } else {
+      $result.Updated++
+      Write-Log "User already existed, updating: $sam" -Color DarkGreen
     }
 
     if ($userObj) {
-      $changePwdParams = @{ Identity = $userObj; ChangePasswordAtLogon = $true; ErrorAction = 'SilentlyContinue' }
-      $changePwdParams += $adServerParams
-      try { Set-ADUser @changePwdParams } catch {}
+      try {
+        Move-ADObject -Identity $userObj.DistinguishedName -TargetPath $ouPath -Server $DC -ErrorAction SilentlyContinue
+      } catch {}
 
-      $addGroupParams = @{ Identity = $groupDn; Members = $userObj; ErrorAction = 'SilentlyContinue' }
-      $addGroupParams += $adServerParams
-      try { Add-ADGroupMember @addGroupParams } catch {}
+      if ($deptGroup) {
+        try { Add-ADGroupMember -Identity $deptGroup -Members $userObj -Server $DC -ErrorAction SilentlyContinue } catch {}
+      }
+      if ($ExecutivesGroup -and $dept -ieq 'Executives') {
+        try { Add-ADGroupMember -Identity $ExecutivesGroup -Members $userObj -Server $DC -ErrorAction SilentlyContinue } catch {}
+      }
+      if ($ManagementGroup -and $dept -ieq 'Management') {
+        try { Add-ADGroupMember -Identity $ManagementGroup -Members $userObj -Server $DC -ErrorAction SilentlyContinue } catch {}
+      }
 
-      $homeUNC   = "\\\\$ServerName\\Home\\$sam"
-      $homeLocal = Join-Path (Join-Path $BasePath 'Home') $sam
+      try {
+        Set-ADUser -Identity $userObj -HomeDrive 'H:' -HomeDirectory "\\$ServerName\Home\$sam" -Server $DC -ErrorAction SilentlyContinue
+      } catch {}
 
-      $homeParams = @{ Identity = $userObj; HomeDrive = 'H:'; HomeDirectory = $homeUNC; ErrorAction = 'SilentlyContinue' }
-      $homeParams += $adServerParams
-      try { Set-ADUser @homeParams } catch {}
-
-      $homeFolderCreated = $false
+      $homeLocal = Join-Path -Path $BasePath -ChildPath (Join-Path -Path 'Home' -ChildPath $sam)
       if (-not (Test-Path -LiteralPath $homeLocal)) {
         New-Item -ItemType Directory -Path $homeLocal -Force | Out-Null
-        $homeFolderCreated = $true
-      }
-
-      if ($homeFolderCreated) {
-        Write-Host ("Ensured home folder: {0} (created)" -f $homeLocal) -ForegroundColor Green
+        Write-Log "Created home folder: $homeLocal" -Color Cyan
       } else {
-        Write-Host ("Ensured home folder: {0} (already existed)" -f $homeLocal) -ForegroundColor Cyan
+        Write-Log "Ensured home folder: $homeLocal" -Color DarkCyan
       }
 
-      if (Test-Path -LiteralPath $homeLocal) {
-        $userSidValue = $null
-        if ($userObj.SID) { $userSidValue = $userObj.SID.Value }
-        $userPrincipalCandidates = Get-IcaclsPrincipalCandidates -SamAccountName $sam -SidValue $userSidValue
+      Invoke-IcaclsReset -Path $homeLocal
+      & icacls $homeLocal /grant 'NT AUTHORITY\SYSTEM:(OI)(CI)F' | Out-Null
+      & icacls $homeLocal /grant 'BUILTIN\Administrators:(OI)(CI)F' | Out-Null
 
-        Invoke-IcaclsCommand -Arguments @($homeLocal,'/inheritance:r') | Out-Null
-        if ($userPrincipalCandidates.Count -gt 0) {
-          Grant-IcaclsPermission -Path $homeLocal -PrincipalCandidates $userPrincipalCandidates -AccessRule '(OI)(CI)F' -Description ("Home full for {0}" -f $sam) | Out-Null
-        } else {
-          Write-Host ("Skipping user home ACL because SID/SAM missing for: {0}" -f $sam) -ForegroundColor Yellow
-        }
-
-        if ($itAclCandidates.Count -gt 0) {
-          Grant-IcaclsPermission -Path $homeLocal -PrincipalCandidates $itAclCandidates -AccessRule '(OI)(CI)F' -Description 'IT home full' | Out-Null
-        } elseif ($itGroupName) {
-          Write-Host ("IT group missing, skipped home-folder grant for: {0}" -f $itGroupName) -ForegroundColor Yellow
-        }
-
-        Invoke-IcaclsCommand -Arguments @($homeLocal,'/grant','NT AUTHORITY\SYSTEM:(OI)(CI)F') -Description 'SYSTEM home full' | Out-Null
-      }
+      $userCandidates = Get-PrincipalCandidates -AdObject $userObj
+      Invoke-IcaclsGrant -Path $homeLocal -RuleTemplate '{0}:(OI)(CI)F' -Candidates $userCandidates -Description "Home full for $sam" | Out-Null
+      $itCandidates = Get-PrincipalCandidates -AdObject $ItGroup
+      Invoke-IcaclsGrant -Path $homeLocal -RuleTemplate '{0}:(OI)(CI)F' -Candidates $itCandidates -Description 'IT home access' | Out-Null
     }
   }
 
-  # Persist any malformed names to the desktop for follow-up.
-  if ($bad.Count -gt 0) {
-    $malformedLogPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'MalformedNames.txt'
-    $bad | Set-Content -LiteralPath $malformedLogPath -Encoding UTF8
-    Write-Host ("Some rows were skipped. See: {0}" -f $malformedLogPath) -ForegroundColor Yellow
+  if ($result.Malformed.Count -gt 0) {
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $outPath = Join-Path -Path $desktop -ChildPath 'MalformedNames.txt'
+    $result.Malformed | Set-Content -Path $outPath -Encoding UTF8
+    Write-Log "Some rows were skipped. See: $outPath" -Color Yellow
+    $result | Add-Member -NotePropertyName MalformedPath -NotePropertyValue $outPath -Force
   }
 
-  Write-Host ("Created {0} users; updated {1} existing users." -f $createdUsers,$updatedUsers) -ForegroundColor Green
-} elseif ($CsvPath) {
-  Write-Warning 'The provided file did not contain any rows to import.'
+  return $result
 }
 
-# Emit a verification summary for shares, OUs, groups, and user import status.
-Write-Host "`nVERIFY:" -ForegroundColor Cyan
-Write-Host ("  Shares on {0}:" -f $ServerName) -ForegroundColor Cyan
-(Get-SmbShare | Where-Object { $_.Name -in ($Departments + 'Home' + 'Profiles') }) |
-  Select-Object Name,Path | Format-Table -AutoSize
+# ---------------------------------------------------------------------------
+# Summary output helper
+# ---------------------------------------------------------------------------
 
-Write-Host "`n  OUs:" -ForegroundColor Cyan
-$ouFilterParts = $Departments | ForEach-Object { "(ou=$_)" }
-$ouFilter = "(|" + ($ouFilterParts -join '') + ")"
-$verifyOuParams = @{ SearchBase = $DomainDN; LDAPFilter = $ouFilter }
-$verifyOuParams += $adServerParams
-Get-ADOrganizationalUnit @verifyOuParams |
-  Select-Object Name | Sort-Object Name | Format-Table -AutoSize
+function Show-Verification {
+  <#
+    .SYNOPSIS
+      Displays post-run verification information to the log window/console.
+  #>
+  param(
+    [Parameter(Mandatory)][string[]]$Departments,
+    [Parameter(Mandatory)][string]$BasePath,
+    [Parameter(Mandatory)]$DeptGroupsMap,
+    $ImportResult,
+    $AltAdminAccount,
+    [Parameter(Mandatory)][string]$ServerName
+  )
 
-Write-Host "`n  Groups (by OU):" -ForegroundColor Cyan
-foreach ($dept in $Departments) {
-  $grpCN = Resolve-DeptGroupName -Department $dept
-  $verifyGroupParams = @{ LDAPFilter = "(cn=$grpCN)"; SearchBase = "OU=$dept,$DomainDN"; ErrorAction = 'SilentlyContinue' }
-  $verifyGroupParams += $adServerParams
-  $grp = Get-ADGroup @verifyGroupParams
-  if ($grp) {
-    Write-Host ("{0,-18} -> {1}" -f $dept, $grp.Name)
-  } else {
-    Write-Host ("{0,-18} -> <missing>" -f $dept)
+  Write-Log ''
+  Write-Log '--- Verification Summary ---' -Color Cyan
+
+  Write-Log "Shares on $ServerName:" -Color Cyan
+  (Get-SmbShare | Where-Object { $_.Name -in ($Departments + 'Home' + 'Profiles') }) | ForEach-Object {
+    Write-Log ("  {0,-20} {1}" -f $_.Name, $_.Path)
   }
-}
 
-Write-Host "`n  Alternate admin account:" -ForegroundColor Cyan
-if ($alternateAdminSummary -and $alternateAdminSummary.SamAccountName) {
-  $accountColor = if ($alternateAdminSummary.Created) { 'Green' } else { 'Cyan' }
-  Write-Host ("    sAMAccountName: {0}" -f $alternateAdminSummary.SamAccountName) -ForegroundColor $accountColor
-  Write-Host ("    Target OU: {0}" -f $alternateAdminSummary.TargetOu) -ForegroundColor $accountColor
-  if ($alternateAdminSummary.GroupMessages -and $alternateAdminSummary.GroupMessages.Count -gt 0) {
-    foreach ($msg in $alternateAdminSummary.GroupMessages) {
-      Write-Host ("    {0}" -f $msg)
+  Write-Log ''
+  Write-Log 'Organizational Units:' -Color Cyan
+  $ouFilterParts = $Departments | ForEach-Object { "(ou=$_)" }
+  $ouFilter = "(|" + ($ouFilterParts -join '') + ")"
+  Get-ADOrganizationalUnit -SearchBase $DomainDN -LDAPFilter $ouFilter | Sort-Object Name | ForEach-Object {
+    Write-Log ("  {0}" -f $_.Name)
+  }
+
+  Write-Log ''
+  Write-Log 'Groups:' -Color Cyan
+  foreach ($dept in $Departments) {
+    $grp = $DeptGroupsMap[$dept]
+    if ($grp) {
+      Write-Log ("  {0,-20} {1}" -f $dept, $grp.Name)
+    } else {
+      Write-Log ("  {0,-20} <missing>" -f $dept)
     }
-  } else {
-    Write-Host '    No group membership updates were applied.' -ForegroundColor Yellow
   }
-} else {
-  Write-Host '    Alternate admin account information unavailable.' -ForegroundColor Yellow
+
+  if ($ImportResult) {
+    Write-Log ''
+    Write-Log ("Users created: {0}, updated: {1}" -f $ImportResult.Created, $ImportResult.Updated) -Color Green
+    if ($ImportResult.PSObject.Properties['MalformedPath']) {
+      Write-Log "Malformed names log: $($ImportResult.MalformedPath)" -Color Yellow
+    }
+  }
+
+  if ($AltAdminAccount) {
+    Write-Log ''
+    Write-Log ("Alternate admin: {0}" -f $AltAdminAccount.SamAccountName) -Color Cyan
+  }
+
+  Write-Log ''
+  Write-Log 'Done.' -Color Green
 }
 
-Write-Host "`n  User import summary:" -ForegroundColor Cyan
-if ($CsvPath) {
-  Write-Host ("    Created: {0}" -f $createdUsers)
-  Write-Host ("    Updated: {0}" -f $updatedUsers)
-  if ($malformedLogPath) {
-    Write-Host ("    Malformed entries logged to: {0}" -f $malformedLogPath) -ForegroundColor Yellow
-  } else {
-    Write-Host '    No malformed entries logged.'
+# ---------------------------------------------------------------------------
+# Main execution logic
+# ---------------------------------------------------------------------------
+
+$configuration = $null
+
+if (-not $NoGui -and $PSBoundParameters.Count -eq 0) {
+  $configuration = Get-ConfigurationFromGui
+  if (-not $configuration) {
+    Write-Host 'Operation cancelled by user.' -ForegroundColor Yellow
+    return
   }
+  Initialize-LogWindow
 } else {
-  Write-Host '    Import skipped (no CSV supplied).'
+  $configuration = [pscustomobject]@{
+    ServerName             = if ([string]::IsNullOrWhiteSpace($ServerName)) { $env:COMPUTERNAME } else { $ServerName.Trim() }
+    BasePath               = if ([string]::IsNullOrWhiteSpace($BasePath)) { 'C:\\Shares' } else { $BasePath.Trim() }
+    Departments            = if ($Departments) { $Departments } else { @('Executives','HR','IT','Management','Accounting','Doctors','Nurses','Laboratory','Medical Records','Facilities') }
+    DefaultPassword        = if ([string]::IsNullOrWhiteSpace($DefaultPassword)) { 'Red.vine1' } else { $DefaultPassword }
+    CsvPath                = if ([string]::IsNullOrWhiteSpace($CsvPath)) { $null } else { $CsvPath }
+    UPNSuffix              = if ([string]::IsNullOrWhiteSpace($UPNSuffix)) { $DNSRoot } else { $UPNSuffix.Trim() }
+    AltAdminDisplayName    = if ([string]::IsNullOrWhiteSpace($AltAdminDisplayName)) { $null } else { $AltAdminDisplayName }
+    AltAdminSamAccountName = if ([string]::IsNullOrWhiteSpace($AltAdminSamAccountName)) { $null } else { $AltAdminSamAccountName }
+    AltAdminPassword       = if ([string]::IsNullOrWhiteSpace($AltAdminPassword)) { $null } else { $AltAdminPassword }
+    SkipFoldersAndShares   = [bool]$SkipFoldersAndShares
+    SkipAclForDepartments  = [bool]$SkipAclForDepartments
+  }
 }
 
-Write-Host "`nDone." -ForegroundColor Green
+if (-not $configuration) {
+  Write-Host 'Configuration could not be determined.' -ForegroundColor Red
+  return
+}
+
+try {
+  $configuration.BasePath = Resolve-AbsolutePath -Path $configuration.BasePath
+} catch {
+  Write-Host $_.Exception.Message -ForegroundColor Red
+  return
+}
+
+if ($configuration.CsvPath) {
+  if (-not (Test-Path -LiteralPath $configuration.CsvPath)) {
+    Write-Host "CSV not found: $($configuration.CsvPath)" -ForegroundColor Red
+    return
+  }
+}
+
+$departments = $configuration.Departments
+if ($departments.Count -lt 5) {
+  Write-Host 'Please specify at least five departments.' -ForegroundColor Red
+  return
+}
+
+Write-Log "Domain: $DNSRoot  |  DN: $DomainDN  |  NetBIOS: $NetBIOS" -Color Cyan
+Write-Log "Server for shares: $($configuration.ServerName)" -Color Cyan
+Write-Log "Base path: $($configuration.BasePath)" -Color Cyan
+Write-Log "Departments: $([string]::Join(', ', $departments))" -Color Cyan
+
+$deptGroups = @{}
+$executivesGroup = $null
+$managementGroup = $null
+$itGroup = $null
+
+if (-not $configuration.SkipFoldersAndShares) {
+  Ensure-Directory -Path $configuration.BasePath
+  Ensure-Directory -Path (Join-Path -Path $configuration.BasePath -ChildPath 'Home')
+  Ensure-Directory -Path (Join-Path -Path $configuration.BasePath -ChildPath 'Profiles')
+  Ensure-Share -Name 'Home' -Path (Join-Path -Path $configuration.BasePath -ChildPath 'Home')
+  Ensure-Share -Name 'Profiles' -Path (Join-Path -Path $configuration.BasePath -ChildPath 'Profiles')
+}
+
+foreach ($dept in $departments) {
+  $folderPath = Join-Path -Path $configuration.BasePath -ChildPath $dept
+  if (-not $configuration.SkipFoldersAndShares) {
+    Ensure-Directory -Path $folderPath
+    Ensure-Share -Name $dept -Path $folderPath
+  }
+  Ensure-OU -OuName $dept
+  Ensure-Group -GroupCN $dept -OuName $dept
+  $deptGroups[$dept] = Get-ADGroup -Identity $dept -ErrorAction SilentlyContinue
+  if ($dept -ieq 'Executives') { $executivesGroup = $deptGroups[$dept] }
+  if ($dept -ieq 'Management') { $managementGroup = $deptGroups[$dept] }
+  if ($dept -ieq 'IT') { $itGroup = $deptGroups[$dept] }
+}
+
+if (-not $itGroup) {
+  Write-Log 'IT group could not be resolved; some permissions may fail.' -Color Yellow
+}
+
+if (-not $configuration.SkipAclForDepartments -and $itGroup) {
+  foreach ($dept in $departments) {
+    $folderPath = Join-Path -Path $configuration.BasePath -ChildPath $dept
+    $deptGroup = $deptGroups[$dept]
+    if (-not $deptGroup) {
+      Write-Log "Skipping ACL for $dept because the group was not found." -Color Yellow
+      continue
+    }
+    Set-DepartmentAcl -Folder $folderPath -Department $dept -DepartmentGroup $deptGroup -ItGroup $itGroup -ExecutivesGroup $executivesGroup -ManagementGroup $managementGroup
+  }
+}
+
+$altAdminAccount = $null
+if ($configuration.AltAdminDisplayName -and $configuration.AltAdminSamAccountName -and $configuration.AltAdminPassword -and $itGroup) {
+  $itOuPath = "OU=IT,$DomainDN"
+  $altAdminAccount = Ensure-AlternateAdminAccount -DisplayName $configuration.AltAdminDisplayName -SamAccountName $configuration.AltAdminSamAccountName -Password $configuration.AltAdminPassword -ItDepartmentOu $itOuPath -ItGroup $itGroup
+}
+
+$importResult = $null
+if ($configuration.CsvPath) {
+  $importResult = Import-UsersFromCsv -CsvPath $configuration.CsvPath -DefaultPassword $configuration.DefaultPassword -ServerName $configuration.ServerName -BasePath $configuration.BasePath -Departments $departments -DeptGroupsMap $deptGroups -ItGroup $itGroup -ExecutivesGroup $executivesGroup -ManagementGroup $managementGroup -UpnSuffix $configuration.UPNSuffix
+}
+
+Show-Verification -Departments $departments -BasePath $configuration.BasePath -DeptGroupsMap $deptGroups -ImportResult $importResult -AltAdminAccount $altAdminAccount -ServerName $configuration.ServerName
+
+if ($script:LogClose) {
+  $script:LogClose.Enabled = $true
+  [System.Windows.Forms.MessageBox]::Show('Provisioning complete. Review the log for details and press Close when finished.','AllInOne AD Setup') | Out-Null
+}
+
